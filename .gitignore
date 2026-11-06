@@ -7,7 +7,9 @@
 
 .claude/
 CLAUDE.md
-AGENTS.md
 .specstory/
 api/data/
 api/exports/
+
+# source bundle (extracted into boot/ and the bw_* files)
+birdwatcher_boot.zip

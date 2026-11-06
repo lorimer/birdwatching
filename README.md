@@ -287,6 +287,69 @@ No buzzer on this env.
 
 Boot sound (XIAO only): first 6 notes of Super Mario Bros. World 1-2 (underground).
 
+### LilyGO T-Display-S3 / T-Display-S3 Touch (`lilygo_t_display_s3`)
+
+| Pin | Function |
+|-----|----------|
+| GPIO 39–42, 45–48, 5–9 | ST7789 170x320, 8-bit parallel (LovyanGFX) |
+| GPIO 38 / 15 | Backlight PWM / panel power enable |
+| GPIO 17 / 18 / 16 / 21 | CST816 touch SCL / SDA / INT / RST |
+| GPIO 14 / 0 | KEY / BOOT buttons |
+| GPIO 4 | Battery voltage (1:2 divider) |
+
+No buzzer or LED on this board; add `-DTDS3_BUZZER_PIN=<gpio>` to the env to drive an external piezo.
+
+**Display pages** — swipe left/right (axis-locked, flick-friendly), tap a header tab, or short-press KEY:
+
+- **RADAR**: radar of every device heard in the last 20 s, placed by signal strength. Flock hits are coloured by tier, ordinary WiFi is grey (APs squares, clients dots), BLE is blue, suspected skimmers are red. Beside it is a 2x3 count grid (FLOCK / SKIM, AP / CLIENT, BLE / SSID). **Tap the radar to cycle the grid through three modes:** `IN RANGE NOW` (live), `SINCE RESET` (a session odometer) and `ALL TIME` (a persisted lifetime odometer). For **Flock and skimmer**, the all-time count is a true **unique** tally: each camera or module MAC is stored once in a persistent set (`/seen.bin`, up to 1024 Flock + 512 skimmer) and never double-counted, surviving reboots. On boot the set is also seeded from the stored session files so cameras logged earlier still count. The other categories (AP, client, BLE, SSID) remain odometers of first-live sightings, flushed to flash within two minutes. Resets live on the STATS page, not here. Over USB, `{"cmd":"seen"}` dumps the stored unique MAC lists and `{"cmd":"counts"}` prints every counter.
+- **FLOCK**: every Flock detection this session, newest first; tap a row for method, tier, RSSI and timing.
+- **AP**: access points heard in the last minute, strongest first, with the network name (SSID) and inferred vendor. Tap for BSSID, vendor, device type and channel.
+- **STA**: client stations, with vendor or `random` for a randomized MAC. Tap for the associated BSSID and the list of networks the client has probed for.
+- **BLE**: ordinary Bluetooth LE devices, with name and a type inferred from the GAP appearance, company ID and name. Tap for vendor, type, address kind and services. Suspected skimmer modules are flagged here (see below).
+- **SSID**: every network name detected, from both beacons and probe requests. Green `AP` means advertised by an access point, amber `probe` means only seen in a client's probe request.
+- **STATS**: uptime, frame rate, per-tier counts, WiFi/BLE/SSID totals, skimmer-suspect count, battery and storage. Touch buttons: **Brightness** (cycles the default level, shown as `n/4`), **USB=full** (checkbox: force full brightness while on USB power), **Flip screen**, **Screen off**, **Reboot** (restarts the device, saved data kept), **Reset session** (zeroes the since-reset odometer) and **Factory reset** (erases every counter, list, saved file and setting). Reboot, Reset session and Factory reset each pop a Confirm / Cancel dialog first.
+
+**Device identification.** APs and clients are labelled with a vendor and device-type guess from the embedded IEEE OUI registry (`oui_vendors.h`, ~40k prefixes, regenerate with `tools/gen_oui_vendors.py`). BLE devices are typed from the GAP appearance field, the manufacturer company ID and name keywords. Randomized MACs cannot be attributed and are shown as such.
+
+**Everything but Flock is display-only.** Ordinary WiFi, BLE, the SSID registry and skimmer flags never enter the Flock detection table, the SPIFFS session, or the JSON stream, so the Flask dashboard still sees only Flock hits.
+
+**Persistence.** The ambient WiFi table, BLE table and SSID registry are saved to SPIFFS (`/ambient.bin`) at most every two minutes and restored on boot, marked as previous-session until heard live again. The Flock session persists separately as before.
+
+A new Flock MAC or a tier upgrade takes over the screen for 6 s in the tier's colour; tiers 3 and 4 flash. Tap or press a button to dismiss.
+
+**Buttons:** KEY short = next page, long = brightness. BOOT short = previous page (pages down through a list), long = screen off/on. The screen wakes itself for any tier 2+ detection. Brightness, orientation and the USB-full setting persist in NVS.
+
+**Brightness in the car.** With **USB=full** enabled (default, on the STATS page) the display jumps to full brightness whenever it detects USB power, which it infers from the battery rail (charging/no-battery reads as external power). The detection is best-effort; the **Brightness** button always sets the default level regardless.
+
+**Boot screen.** On power-up the device plays a short "Birdwatcher" boot animation
+(a rifle scope locking onto a camera-headed bird, then a BIRD / WATCHER wordmark),
+then drops straight into the live UI with no boot-log text. Replay it any time with
+`{"cmd":"boot_demo"}` over serial. The animation code is `bw_boot_anim.inc` with the
+embedded art in `bw_scene_png.h` / `bw_wordmark_png.h`; the source art and the
+regeneration script live in [`boot/`](boot/), and [`BOOT_SCREEN_HANDOFF.md`](BOOT_SCREEN_HANDOFF.md)
+explains how it is wired in.
+
+### BLE credit-card skimmer detection
+
+Many BLE credit-card skimmers use a cheap serial-bridge module (HM-10 and its AT-09 / CC41-A / MLT-BT05 / JDY clones) as their Bluetooth front end. These advertise recognizable default names and expose a raw serial GATT service (`0xFFE0`/`0xFFE1`). The firmware flags such devices on the BLE page and radar:
+
+- **`SKIM?` (red)** — the advertised name matches a known serial-bridge module (`HC-05`, `AT-09`, `CC41-A`, `MLT-BT05`, `JDY-xx`, `HMSoft`, ...). This is the only case that raises an alert or counts as a suspect.
+- **`serial` (amber, informational)** — the device merely exposes a raw serial service (`0xFFE0`). This is **very common in ordinary IoT and hobby gear**, so it is shown quietly and never alerts or counts.
+
+When a **name-match** suspect is first identified it raises a full-screen red `SUSPECT SKIMMER` alert with the same prominence as a Flock hit, and the RADAR grid's SKIM cell turns red with the count.
+
+**This is a weak signal and false positives are expected.** The same modules are in smart bulbs, trackers, fitness gear and countless hobby projects, so a hit at home or around everyday electronics is almost certainly harmless. The flag means "a device is using the type of module skimmers use" — look closer in person, do not assume a skimmer.
+
+> **Hardware limit:** the T-Display-S3 uses an **ESP32-S3, which is Bluetooth Low Energy only** and has no Bluetooth Classic (BR/EDR) radio. The classic **HC-05 / HC-06** modules in most gas-pump skimmers are Bluetooth Classic and **cannot be seen by this hardware at all** — only BLE modules are detectable here. For classic HC-05 detection use a plain ESP32 board and a tool such as the Skimmer Scanner app.
+
+**Test the display** without any hardware present (display only, nothing is logged or emitted):
+
+```bash
+echo '{"cmd":"ui_demo","tier":4}' > /dev/ttyACM0   # full-screen Flock alert
+echo '{"cmd":"ble_demo"}'          > /dev/ttyACM0   # inject sample BLE devices incl. a skimmer
+echo '{"cmd":"boot_demo"}'         > /dev/ttyACM0   # replay the boot animation
+```
+
 ### Detection audio
 
 Each tier has its own tone (see the table above), so the detection method is clear without looking at the screen. Individual tiers can be muted from the dashboard's **Audio** panel; muting affects the buzzer only, and detections still log and export. The mask lives in NVS under `flockyou/beepmask` and survives a power cycle.
@@ -297,13 +360,23 @@ The heartbeat uses the tone of the strongest tier currently in range, so muting 
 
 ## Build and flash
 
-Requires [PlatformIO](https://platformio.org/).
+**Just want to flash a T-Display-S3 with no toolchain?** Use the pre-built image in
+[`dist/`](dist/) and follow [`FLASHING.md`](FLASHING.md) — a step-by-step guide for
+Windows, macOS and Linux that assumes no prior experience and works no matter what
+firmware is on the board now.
+
+**Building from source** requires [PlatformIO](https://platformio.org/).
 
 ```bash
 pio run -e xiao_esp32s3              # build
+pio run -e lilygo_t_display_s3 -t upload   # T-Display-S3 build + flash
 pio run -e xiao_esp32s3 -t upload    # flash
 pio device monitor
 ```
+
+**Developing features (incl. with a coding agent):** see [`AGENTS.md`](AGENTS.md)
+for the working rules and commands and [`ARCHITECTURE.md`](ARCHITECTURE.md) for the
+code map.
 
 `platformio.ini` and `partitions.csv` are at the root: 6 MB app, 1.94 MB SPIFFS, and a 20 KB `nvs` partition that holds the per-tier beep mask. XIAO needs no extra libraries.
 

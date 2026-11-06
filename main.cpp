@@ -7,6 +7,7 @@
 #include <Preferences.h>
 #include <NimBLEDevice.h>   // BLE side of the signature union (Flock BLE adverts)
 #include "display_dongle.h"
+#include "display_tdisplay_s3.h"
 
 // ============================================================
 // CONFIG  (board defaults; override via platformio build_flags)
@@ -23,6 +24,18 @@
 #define APA102_FLASH_G     0
 #define APA102_FLASH_B     0
 #define MIRROR_SERIAL      0   // GPIO43 is UART TX on this board
+#elif defined(BOARD_LILYGO_T_DISPLAY_S3)
+// LilyGO T-Display-S3: no onboard buzzer or user LED. Detections are shown on
+// the 170x320 display (display_tdisplay_s3.cpp). A piezo can be added on a
+// free header pin with -DTDS3_BUZZER_PIN=<gpio>.
+#ifdef TDS3_BUZZER_PIN
+#define BUZZER_PIN         TDS3_BUZZER_PIN
+#define USE_BUZZER         1
+#else
+#define USE_BUZZER         0
+#endif
+#define USE_LED            0
+#define MIRROR_SERIAL      0
 #else
 // Seeed XIAO ESP32-S3
 #define BUZZER_PIN         3
@@ -249,6 +262,207 @@ static volatile size_t alertHead = 0;  // written by callback
 static volatile size_t alertTail = 0;  // read by loop()
 static portMUX_TYPE    queueMux  = portMUX_INITIALIZER_UNLOCKED;
 
+#ifdef BOARD_LILYGO_T_DISPLAY_S3
+// ------------------------------------------------------------
+// AMBIENT WIFI  — display-only view of ordinary (non-Flock) transmitters.
+// Never touches fyDet, SPIFFS, or the JSON stream; the dashboard stays
+// Flock-only. Callback pushes into a lossy ring, loop() folds it into a
+// small table that the radar draws in grey.
+// ------------------------------------------------------------
+#define AMB_RING_SIZE  64
+#define AMB_MAX       128
+typedef struct {
+  uint8_t mac[6];
+  uint8_t bssid[6];
+  uint8_t hasBssid;
+  int8_t  rssi;
+  uint8_t ch;
+  uint8_t ap;
+  char    ssid[24];
+} AmbRaw;
+static volatile AmbRaw  ambRing[AMB_RING_SIZE];
+static volatile size_t  ambHead = 0, ambTail = 0;
+static portMUX_TYPE     ambMux  = portMUX_INITIALIZER_UNLOCKED;
+
+typedef struct {
+  uint8_t  mac[6];      // BSSID (AP) or station MAC (client)
+  uint8_t  bssid[6];    // AP a client is associated with (clients only)
+  uint8_t  hasBssid;
+  int8_t   rssi;
+  uint8_t  ch;
+  uint8_t  ap;          // 1 = access point (beacon / probe resp / from-DS data)
+  uint8_t  prev;        // 1 = restored from a previous session, not heard yet live
+  char     ssid[24];    // AP broadcast network name
+  char     probed[TDS_PROBE_MAX][24];  // client: networks it has probed for
+  uint8_t  probedCount;
+  uint32_t lastSeen;
+  uint32_t firstSeen;
+  uint16_t count;
+} AmbEntry;
+static AmbEntry ambTab[AMB_MAX];
+static int      ambCount = 0;
+static bool     ambDirty = false;   // a new device appeared since the last save
+
+// Odometer counters behind the RADAR summary. Session resets on demand;
+// lifetime is persisted in NVS and resets only on an explicit all-time reset.
+// They count first-live sightings, so they are not capped by the 128-entry
+// tables (a device re-seen in a later session counts again — an odometer, not
+// a unique-ever count, which can't be kept without storing every MAC).
+static uint32_t cntSess[TDSC_N] = {0};
+static uint32_t cntLife[TDSC_N] = {0};
+static bool     cntLifeDirty = false;
+static Preferences lifePrefs;
+static void cntLifeSave() {
+  lifePrefs.begin("fylife", false);
+  lifePrefs.putBytes("life", cntLife, sizeof(cntLife));
+  lifePrefs.end();
+  cntLifeDirty = false;
+}
+static inline void cntBump(int c) {
+  if (c >= 0 && c < TDSC_N) { cntSess[c]++; cntLife[c]++; cntLifeDirty = true; }
+}
+
+// Persistent sets of unique Flock and skimmer MACs ever seen. These give a
+// true all-time UNIQUE count (not an odometer): a camera re-seen later is not
+// double-counted. Flock cams and skimmer modules are rare, so a flat list with
+// a linear dedup scan is plenty, and the whole thing is a few KB on SPIFFS.
+#define FLOCK_SEEN_MAX 1024
+#define SKIM_SEEN_MAX   512
+static uint8_t flockSeen[FLOCK_SEEN_MAX][6];
+static int     flockSeenN = 0;
+static uint8_t skimSeen[SKIM_SEEN_MAX][6];
+static int     skimSeenN = 0;
+static void seenSave();                       // defined with the other SPIFFS I/O
+static bool seenContains(const uint8_t set[][6], int n, const uint8_t* mac) {
+  for (int i = 0; i < n; i++) if (memcmp(set[i], mac, 6) == 0) return true;
+  return false;
+}
+static bool flockSeenAdd(const uint8_t* mac) {
+  if (seenContains(flockSeen, flockSeenN, mac)) return false;
+  if (flockSeenN >= FLOCK_SEEN_MAX) return false;
+  memcpy(flockSeen[flockSeenN++], mac, 6);
+  return true;
+}
+static bool skimSeenAdd(const uint8_t* mac) {
+  if (seenContains(skimSeen, skimSeenN, mac)) return false;
+  if (skimSeenN >= SKIM_SEEN_MAX) return false;
+  memcpy(skimSeen[skimSeenN++], mac, 6);
+  return true;
+}
+
+// Global registry of every network name heard, from beacons and probes.
+#define SSID_REG_MAX 96
+typedef struct {
+  char     ssid[24];
+  uint8_t  bssid[6];    // AP BSSID, or the client MAC that probed for it
+  int8_t   rssi;
+  uint8_t  ch;
+  uint8_t  fromAp;      // 1 = advertised by an AP; 0 = only seen in probe requests
+  uint8_t  prev;
+  uint16_t count;
+  uint32_t lastSeen;
+} SsidEntry;
+static SsidEntry ssidReg[SSID_REG_MAX];
+static int       ssidRegCount = 0;
+
+static void ssidRegAdd(const char* ssid, const uint8_t* bssid, int8_t rssi,
+                       uint8_t ch, uint8_t fromAp, uint32_t now) {
+  if (!ssid || !ssid[0]) return;
+  int slot = -1, oldest = 0;
+  for (int i = 0; i < ssidRegCount; i++) {
+    if (strcmp(ssidReg[i].ssid, ssid) == 0) { slot = i; break; }
+    if (ssidReg[i].lastSeen < ssidReg[oldest].lastSeen) oldest = i;
+  }
+  bool existed = (slot >= 0);
+  bool wasPrev = existed ? (ssidReg[slot].prev != 0) : false;
+  if (slot < 0) {
+    slot = (ssidRegCount < SSID_REG_MAX) ? ssidRegCount++ : oldest;
+    strlcpy(ssidReg[slot].ssid, ssid, sizeof(ssidReg[slot].ssid));
+    ssidReg[slot].count = 0;
+    ssidReg[slot].fromAp = 0;
+    ambDirty = true;
+  }
+  if (!existed || wasPrev) cntBump(TDSC_SSID);
+  SsidEntry& e = ssidReg[slot];
+  e.prev = 0; e.rssi = rssi; e.ch = ch; e.fromAp |= fromAp; e.lastSeen = now;
+  if (bssid) memcpy(e.bssid, bssid, 6);
+  if (e.count < 0xFFFF) e.count++;
+}
+
+static void IRAM_ATTR ambPush(const uint8_t* mac, const uint8_t* bssid, uint8_t hasBssid,
+                              int8_t rssi, uint8_t ch, uint8_t ap, const char* ssid) {
+  portENTER_CRITICAL_ISR(&ambMux);
+  size_t next = (ambHead + 1) % AMB_RING_SIZE;
+  if (next != ambTail) {            // full → drop, it's only eye candy
+    AmbRaw* r = (AmbRaw*)&ambRing[ambHead];
+    memcpy(r->mac, mac, 6);
+    if (hasBssid && bssid) memcpy(r->bssid, bssid, 6); else memset(r->bssid, 0, 6);
+    r->hasBssid = hasBssid; r->rssi = rssi; r->ch = ch; r->ap = ap;
+    int i = 0;
+    if (ssid) { for (; i < 23 && ssid[i]; i++) r->ssid[i] = ssid[i]; }
+    r->ssid[i] = '\0';
+    ambHead = next;
+  }
+  portEXIT_CRITICAL_ISR(&ambMux);
+}
+
+// ------------------------------------------------------------
+// AMBIENT BLE  — display-only view of ordinary (non-Flock) BLE advertisers.
+// Mirrors the WiFi ambient path: NimBLE host task pushes into a lossy ring,
+// loop() folds it into a table the BLE page draws in grey. Flock BLE hits
+// still go through the detection table and are unaffected.
+// ------------------------------------------------------------
+#define BLE_RING_SIZE  48
+#define BLE_MAX       128
+typedef struct {
+  uint8_t  mac[6];
+  uint8_t  addrType;      // 0 public, 1 random, 2 public-id, 3 random-id
+  int8_t   rssi;
+  uint16_t appearance;    // GAP appearance (0 = none advertised)
+  uint16_t company;       // manufacturer company ID (0xFFFF = none)
+  uint8_t  svc;           // advertised service UUID count
+  uint8_t  skimmer;       // 0 none, 1 raw serial service, 2 known skimmer module
+  char     name[24];
+} BleRaw;
+static volatile BleRaw  bleRing[BLE_RING_SIZE];
+static volatile size_t  bleHead = 0, bleTail = 0;
+static portMUX_TYPE     bleMux  = portMUX_INITIALIZER_UNLOCKED;
+
+typedef struct {
+  uint8_t  mac[6];
+  uint8_t  addrType;
+  int8_t   rssi;
+  uint16_t appearance;
+  uint16_t company;
+  uint8_t  svc;
+  uint8_t  skimmer;
+  char     name[24];
+  uint8_t  prev;
+  uint32_t lastSeen;
+  uint32_t firstSeen;
+  uint16_t count;
+} BleEntry;
+static BleEntry bleTab[BLE_MAX];
+static int      bleCount = 0;
+
+static void blePush(const uint8_t* mac, uint8_t at, int8_t rssi, uint16_t app,
+                    uint16_t company, uint8_t svc, uint8_t skimmer, const char* name) {
+  portENTER_CRITICAL(&bleMux);     // NimBLE host task context (not an ISR)
+  size_t next = (bleHead + 1) % BLE_RING_SIZE;
+  if (next != bleTail) {
+    BleRaw* r = (BleRaw*)&bleRing[bleHead];
+    memcpy(r->mac, mac, 6);
+    r->addrType = at; r->rssi = rssi; r->appearance = app;
+    r->company = company; r->svc = svc; r->skimmer = skimmer;
+    int i = 0;
+    if (name) { for (; i < 23 && name[i]; i++) r->name[i] = name[i]; }
+    r->name[i] = '\0';
+    bleHead = next;
+  }
+  portEXIT_CRITICAL(&bleMux);
+}
+#endif
+
 static void IRAM_ATTR enqueueAlert(AlertType type, const uint8_t* mac, int8_t rssi,
                                     uint8_t ch, const char* ssid, const char* kind) {
   portENTER_CRITICAL_ISR(&queueMux);
@@ -311,6 +525,7 @@ static size_t   fullHopIndex = 0;
 static unsigned long lastHop = 0;
 static unsigned long lastHeartbeat = 0;
 static volatile bool sniffingStopped = false;
+static volatile uint32_t fyFrameCount = 0;   // promiscuous frames seen (UI stats)
 
 // Dedupe table (small circular, avoids single-slot eviction bug).
 // This is the *serial-rate-limit* dedup — it suppresses beep + emit within
@@ -728,6 +943,14 @@ static int fyAddDetection(const char* mac, const char* method, uint8_t tier,
   else                 d.ssid[0] = '\0';
   fyDetCount++;
   fyDirty = true;
+#ifdef BOARD_LILYGO_T_DISPLAY_S3
+  cntBump(TDSC_FLOCK);
+  { unsigned bb[6];
+    if (sscanf(mac, "%x:%x:%x:%x:%x:%x", &bb[0],&bb[1],&bb[2],&bb[3],&bb[4],&bb[5]) == 6) {
+      uint8_t mb[6]; for (int i = 0; i < 6; i++) mb[i] = (uint8_t)bb[i];
+      if (flockSeenAdd(mb)) seenSave();     // new unique camera — persist the set now
+    } }
+#endif
   if (outChirpWorthy) *outChirpWorthy = true;
   return fyDetCount - 1;
 }
@@ -1188,6 +1411,77 @@ static void handleCommandLine(const char* line) {
     return;
   }
 
+#ifdef BOARD_LILYGO_T_DISPLAY_S3
+  // {"cmd":"boot_demo"} — replay the boot animation without rebooting.
+  if (strstr(line, "\"boot_demo\"")) {
+    tdsBootAnim();
+    dualPrintf("[flockyou] boot_demo (display only)\n");
+    return;
+  }
+
+  // {"cmd":"ui_demo","tier":4} — display-only test alert. Does not touch the
+  // detection table, SPIFFS, or the JSON detection stream.
+  if (strstr(line, "\"ui_demo\"")) {
+    const char* tp = strstr(line, "\"tier\"");
+    unsigned tier = TIER_IE_SIG;
+    if (tp) sscanf(tp + 6, " : %u", &tier);
+    if (tier >= TIER_COUNT) tier = TIER_IE_SIG;
+    tdsAlert("de:mo:00:00:00:01", "demo_alert", (uint8_t)tier, -61,
+             currentChannel, "", 1, true);
+    dualPrintf("[flockyou] ui_demo tier=%u (display only)\n", tier);
+    return;
+  }
+
+  // {"cmd":"counts"} — print the session + all-time odometers (diagnostic).
+  if (strstr(line, "\"counts\"")) {
+    dualPrintf("{\"event\":\"counts\",\"session\":{\"flock\":%u,\"ap\":%u,\"client\":%u,\"ble\":%u,\"skim\":%u,\"ssid\":%u},"
+               "\"alltime\":{\"flock\":%u,\"ap\":%u,\"client\":%u,\"ble\":%u,\"skim\":%u,\"ssid\":%u},"
+               "\"flock_rows\":%d,\"flock_unique\":%d,\"skim_unique\":%d}\n",
+               (unsigned)cntSess[0],(unsigned)cntSess[1],(unsigned)cntSess[2],(unsigned)cntSess[3],(unsigned)cntSess[4],(unsigned)cntSess[5],
+               (unsigned)flockSeenN,(unsigned)cntLife[1],(unsigned)cntLife[2],(unsigned)cntLife[3],(unsigned)skimSeenN,(unsigned)cntLife[5],
+               fyDetCount, flockSeenN, skimSeenN);
+    return;
+  }
+
+  // {"cmd":"seen"} — dump the stored unique flock + skimmer MACs (searchable log).
+  if (strstr(line, "\"seen\"")) {
+    dualPrintf("{\"event\":\"seen_begin\",\"flock\":%d,\"skim\":%d}\n", flockSeenN, skimSeenN);
+    for (int i = 0; i < flockSeenN; i++)
+      dualPrintf("{\"seen\":\"flock\",\"mac\":\"%02x:%02x:%02x:%02x:%02x:%02x\"}\n",
+                 flockSeen[i][0],flockSeen[i][1],flockSeen[i][2],flockSeen[i][3],flockSeen[i][4],flockSeen[i][5]);
+    for (int i = 0; i < skimSeenN; i++)
+      dualPrintf("{\"seen\":\"skim\",\"mac\":\"%02x:%02x:%02x:%02x:%02x:%02x\"}\n",
+                 skimSeen[i][0],skimSeen[i][1],skimSeen[i][2],skimSeen[i][3],skimSeen[i][4],skimSeen[i][5]);
+    dualPrintln("{\"event\":\"seen_end\"}");
+    return;
+  }
+
+  // {"cmd":"flock_demo"} — inject a REAL flock detection through the production
+  // path (fyAddDetection), so the counter + persistence chain is exercised.
+  if (strstr(line, "\"flock_demo\"")) {
+    static int nth = 0;
+    char mac[18];
+    snprintf(mac, sizeof(mac), "de:ad:f1:0c:00:%02x", (unsigned)(++nth));
+    bool cw = false;
+    fyAddDetection(mac, "wifi_wildcard_probe_ie_sig", TIER_IE_SIG, -50, 6, "", &cw);
+    dualPrintf("[flockyou] flock_demo injected %s\n", mac);
+    return;
+  }
+
+  // {"cmd":"ble_demo"} — inject synthetic BLE devices (display only) so the
+  // BLE page and skimmer badge can be checked without real hardware.
+  if (strstr(line, "\"ble_demo\"")) {
+    uint8_t m1[6] = {0xDE,0xAD,0xBE,0xEF,0x00,0x11};
+    blePush(m1, 1, -46, 0, 0xFFFF, 1, 2, "HC-05");                 // skimmer-name
+    uint8_t m2[6] = {0xDE,0xAD,0xBE,0xEF,0x00,0x22};
+    blePush(m2, 1, -58, 0, 0xFFFF, 1, 1, "BT-serial");             // raw serial svc
+    uint8_t m3[6] = {0xDE,0xAD,0xBE,0xEF,0x00,0x33};
+    blePush(m3, 1, -63, 0x00C0, 0x004C, 2, 0, "Apple Watch");      // normal device
+    dualPrintln("[flockyou] ble_demo injected (display only)");
+    return;
+  }
+#endif
+
   if (strstr(line, "\"set_beep_mask\"")) {
     const char* m = strstr(line, "\"mask\"");
     unsigned v = 0;
@@ -1498,6 +1792,7 @@ static bool IRAM_ATTR fyProbeBodyFlockIeSigPrimary(const uint8_t* body, int body
 
 static void IRAM_ATTR wifiSniffer(void* buf, wifi_promiscuous_pkt_type_t type) {
   if (!buf || sniffingStopped) return;
+  fyFrameCount++;
 
 #if PROCESS_MGMT_FRAMES && PROCESS_DATA_FRAMES
   if (type != WIFI_PKT_MGMT && type != WIFI_PKT_DATA) return;
@@ -1528,7 +1823,36 @@ static void IRAM_ATTR wifiSniffer(void* buf, wifi_promiscuous_pkt_type_t type) {
   // Ordering matters only for which sound plays first inside a cooldown
   // window; correctness does not depend on it, since a later higher-tier hit
   // is allowed to preempt.
-  if (matchOuiRaw(hdr->addr2)) {
+  const bool ouiHit = matchOuiRaw(hdr->addr2);
+#ifdef BOARD_LILYGO_T_DISPLAY_S3
+  if (!ouiHit && !(hdr->addr2[0] & 0x01)) {
+    uint8_t fc0 = hdr->frame_ctrl & 0xFF, fc1 = hdr->frame_ctrl >> 8;
+    uint8_t ft = (fc0 >> 2) & 0x03, st = (fc0 >> 4) & 0x0F;
+    uint8_t tods = fc1 & 0x01, fromds = (fc1 >> 1) & 0x01;
+    uint8_t ap = 0, hasB = 0;
+    const uint8_t* bssid = nullptr;
+    // Pull the SSID IE where the frame carries one, and work out the BSSID.
+    // beacon/probe-resp: addr3 is the BSSID and the body (after the 12-byte
+    // fixed field) carries the network name. probe request: addr2 is a client
+    // and the body carries the SSID it is looking for. data frames: the BSSID
+    // is addr2 when the AP is transmitting (FromDS) or addr1 when a client is
+    // (ToDS). All of this is broadcast in the clear.
+    char assid[24]; assid[0] = '\0';
+    if (ft == 0) {
+      if (st == 8 || st == 5) { ap = 1; bssid = hdr->addr3; hasB = 1; }
+      if (st == 8 || st == 5 || st == 4) {
+        int hoff = (int)sizeof(wifi_ieee80211_mac_hdr_t) + ((st == 4) ? 0 : 12);
+        int blen = (int)pkt->rx_ctrl.sig_len - hoff;
+        if (blen > 0) extractSsidFromMgmtBody(pkt->payload + hoff, blen, assid, sizeof(assid));
+      }
+    } else if (ft == 2) {
+      if (fromds && !tods)      { ap = 1; bssid = hdr->addr2; hasB = 1; }  // AP → client
+      else if (tods && !fromds) {        bssid = hdr->addr1; hasB = 1; }   // client → AP
+    }
+    ambPush(hdr->addr2, bssid, hasB, rssi, ch, ap, assid);
+  }
+#endif
+  if (ouiHit) {
     bool fingerprinted = false;
 
     if (type == WIFI_PKT_MGMT) {
@@ -1726,6 +2050,10 @@ static void drainAlertQueue() {
     char methodLine[40];
     snprintf(methodLine, sizeof(methodLine), "%s_%s", isBle ? "ble" : "wifi", method);
     dongleDisplayShowAlert(methodLine, macStr, e.rssi, e.channel, ALERT_COOLDOWN_MS);
+#ifdef BOARD_LILYGO_T_DISPLAY_S3
+    tdsAlert(macStr, methodLine, tier, e.rssi, e.channel, isBle ? e.ssid : "",
+             (idx >= 0) ? (int)fyDet[idx].count : 1, chirpWorthy);
+#endif
 
 #if STOP_ON_OUI_HIT
     if (e.type != ALERT_SSID) stopSniffing("OUI hit");
@@ -1816,6 +2144,29 @@ static bool fyBleNameIsBareSerial(const char* n) {
 // Evaluate one advert against the Flock BLE signature set and enqueue the
 // highest-signal match (name > mfg > GATT). Runs on the NimBLE host task;
 // enqueueAlert's critical-section ring is safe from task context.
+#ifdef BOARD_LILYGO_T_DISPLAY_S3
+// Cheap BLE serial-bridge modules (HM-10 and its clones) are the Bluetooth
+// front end of many BLE credit-card skimmers. They ship with recognizable
+// default names and expose a raw serial GATT service (0xFFE0/0xFFE1). None of
+// this is proof of a skimmer — the same modules show up in hobby electronics —
+// so a hit is flagged as a SUSPECT serial module, not a verdict.
+//
+// Note: classic HC-05/HC-06 skimmers use Bluetooth Classic (BR/EDR), which the
+// ESP32-S3 radio cannot receive at all. Only BLE modules are detectable here.
+static bool bleNameIsSerialModule(const char* n) {
+  if (!n || !n[0]) return false;
+  char low[24]; int i = 0;
+  for (; n[i] && i < 23; i++) low[i] = (char)tolower((unsigned char)n[i]);
+  low[i] = '\0';
+  static const char* const PAT[] = {
+    "hc-05", "hc-06", "hc-08", "hc-42", "bt05", "at-09", "at-05", "jdy-",
+    "cc41", "mlt-bt05", "spp-ca", "hmsoft", "hm-10", "hm10", "kcx_bt", "zs-040"
+  };
+  for (auto p : PAT) if (strstr(low, p)) return true;
+  return false;
+}
+#endif
+
 static void fyBleCheckDevice(NimBLEAdvertisedDevice* dev) {
   int rssi = dev->getRSSI();
   if (rssi < RSSI_MIN) return;
@@ -1858,12 +2209,39 @@ static void fyBleCheckDevice(NimBLEAdvertisedDevice* dev) {
     }
   }
 
-  if (!matched) return;
-
   // NimBLE stores the address LSB-first; flip to display (MSB-first) order.
   const uint8_t* nat = dev->getAddress().getNative();
   uint8_t mac[6];
   for (int i = 0; i < 6; i++) mac[i] = nat[5 - i];
+
+  if (!matched) {
+#ifdef BOARD_LILYGO_T_DISPLAY_S3
+    // Non-Flock advertiser → ambient BLE table (display only). Collect the
+    // device-type signals that BLE broadcasts in the clear: GAP appearance,
+    // manufacturer company ID, advertised name and service count.
+    uint16_t app = dev->haveAppearance() ? dev->getAppearance() : 0;
+    uint16_t company = 0xFFFF;
+    if (dev->haveManufacturerData()) {
+      std::string md = dev->getManufacturerData();
+      if (md.size() >= 2) company = (uint16_t)(uint8_t)md[0] | ((uint16_t)(uint8_t)md[1] << 8);
+    }
+    // skimmer heuristic: a known module name is the stronger signal; a raw
+    // serial service (0xFFE0/0xFFE1) alone is weaker (common in hobby gear too).
+    uint8_t serialSvc = 0;
+    int svcN = (int)dev->getServiceUUIDCount();
+    for (int i = 0; i < svcN; i++) {
+      NimBLEUUID u = dev->getServiceUUID(i);
+      if (u.bitSize() == 16) {
+        uint16_t v = u.getNative()->u16.value;
+        if (v == 0xFFE0 || v == 0xFFE1) { serialSvc = 1; break; }
+      }
+    }
+    uint8_t skimmer = bleNameIsSerialModule(name) ? 2 : (serialSvc ? 1 : 0);
+    blePush(mac, dev->getAddressType(), (int8_t)rssi, app, company,
+            (uint8_t)svcN, skimmer, name[0] ? name : nullptr);
+#endif
+    return;
+  }
 
   enqueueAlert(hit, mac, (int8_t)rssi, 0xFF, name[0] ? name : nullptr, "ble_adv");
 }
@@ -1888,6 +2266,319 @@ static void fyBleStart() {
              (unsigned)FY_BLE_SCAN_WINDOW_MS, (unsigned)FY_BLE_SCAN_INTERVAL_MS);
 }
 
+#ifdef BOARD_LILYGO_T_DISPLAY_S3
+// ============================================================
+// UI ACCESSORS  — read-only views for display_tdisplay_s3.cpp
+// ============================================================
+// Called from loop() context only (same task that owns fyDet), so no locking.
+int fyUiDetCount() { return fyDetCount; }
+bool fyUiGetDet(int i, TdsDetView* out) {
+  if (i < 0 || i >= fyDetCount || !out) return false;
+  const FYDetection& d = fyDet[i];
+  out->mac = d.mac;  out->method = d.method;  out->name = d.ssid;
+  out->tier = d.tier; out->rssi = d.rssi;     out->channel = d.channel;
+  out->firstSeen = d.firstSeen; out->lastSeen = d.lastSeen; out->count = d.count;
+  return true;
+}
+uint8_t  fyUiBeepMask()    { return fyBeepMask; }
+bool     fyUiSpiffsReady() { return fySpiffsReady; }
+uint32_t fyUiFrameCount()  { return fyFrameCount; }
+
+static void drainAmbient() {
+  uint32_t now = millis();
+  while (true) {
+    portENTER_CRITICAL(&ambMux);
+    if (ambTail == ambHead) { portEXIT_CRITICAL(&ambMux); break; }
+    AmbRaw r;
+    memcpy(&r, (const void*)&ambRing[ambTail], sizeof(r));
+    ambTail = (ambTail + 1) % AMB_RING_SIZE;
+    portEXIT_CRITICAL(&ambMux);
+
+    int slot = -1, oldest = 0;
+    for (int i = 0; i < ambCount; i++) {
+      if (memcmp(ambTab[i].mac, r.mac, 6) == 0) { slot = i; break; }
+      if (ambTab[i].lastSeen < ambTab[oldest].lastSeen) oldest = i;
+    }
+    bool existed = (slot >= 0);
+    bool wasPrev = existed ? (ambTab[slot].prev != 0) : false;
+    if (slot < 0) {
+      slot = (ambCount < AMB_MAX) ? ambCount++ : oldest;   // evict stalest
+      memset(&ambTab[slot], 0, sizeof(AmbEntry));
+      memcpy(ambTab[slot].mac, r.mac, 6);
+      ambTab[slot].firstSeen = now;
+      ambTab[slot].rssi = r.rssi;
+      ambDirty = true;
+    }
+    AmbEntry& a = ambTab[slot];
+    bool firstLive = !existed || wasPrev;
+    a.prev = 0;                                     // heard live this session
+    a.rssi = (int8_t)((a.rssi * 3 + r.rssi) / 4);   // smooth the jitter
+    a.ch = r.ch;
+    a.ap |= r.ap;
+    a.lastSeen = now;
+    if (a.count < 0xFFFF) a.count++;
+    if (firstLive) cntBump(a.ap ? TDSC_AP : TDSC_CLIENT);
+    if (r.hasBssid) { memcpy(a.bssid, r.bssid, 6); a.hasBssid = 1; }
+    if (r.ssid[0]) {
+      if (r.ap) {
+        strlcpy(a.ssid, r.ssid, sizeof(a.ssid));              // AP network name
+      } else {
+        bool seen = false;                                   // client probed SSID
+        for (int k = 0; k < a.probedCount; k++)
+          if (strcmp(a.probed[k], r.ssid) == 0) { seen = true; break; }
+        if (!seen && a.probedCount < TDS_PROBE_MAX)
+          strlcpy(a.probed[a.probedCount++], r.ssid, sizeof(a.probed[0]));
+      }
+      ssidRegAdd(r.ssid, r.mac, r.rssi, r.ch, r.ap, now);    // global SSID registry
+    }
+  }
+}
+
+int fyUiAmbCount() { return ambCount; }
+bool fyUiGetAmb(int i, TdsAmbView* out) {
+  if (i < 0 || i >= ambCount || !out) return false;
+  const AmbEntry& a = ambTab[i];
+  memcpy(out->mac, a.mac, 6);
+  memcpy(out->bssid, a.bssid, 6);
+  out->hasBssid = a.hasBssid;
+  out->rssi = a.rssi; out->ch = a.ch; out->ap = a.ap; out->prev = a.prev;
+  out->lastSeen = a.lastSeen; out->firstSeen = a.firstSeen; out->count = a.count;
+  strlcpy(out->ssid, a.ssid, sizeof(out->ssid));
+  out->probedCount = a.probedCount;
+  for (int k = 0; k < a.probedCount && k < TDS_PROBE_MAX; k++)
+    strlcpy(out->probed[k], a.probed[k], sizeof(out->probed[0]));
+  return true;
+}
+
+int fyUiSsidCount() { return ssidRegCount; }
+bool fyUiGetSsid(int i, TdsSsidView* out) {
+  if (i < 0 || i >= ssidRegCount || !out) return false;
+  const SsidEntry& e = ssidReg[i];
+  strlcpy(out->ssid, e.ssid, sizeof(out->ssid));
+  memcpy(out->bssid, e.bssid, 6);
+  out->rssi = e.rssi; out->ch = e.ch; out->fromAp = e.fromAp;
+  out->prev = e.prev; out->count = e.count; out->lastSeen = e.lastSeen;
+  return true;
+}
+
+uint32_t fyUiSess(int c) { return (c >= 0 && c < TDSC_N) ? cntSess[c] : 0; }
+uint32_t fyUiLife(int c) {
+  if (c == TDSC_FLOCK) return (uint32_t)flockSeenN;   // true unique counts
+  if (c == TDSC_SKIM)  return (uint32_t)skimSeenN;
+  return (c >= 0 && c < TDSC_N) ? cntLife[c] : 0;
+}
+void fyUiResetSession() { for (int i = 0; i < TDSC_N; i++) cntSess[i] = 0; }
+void fyUiResetLife()    { for (int i = 0; i < TDSC_N; i++) cntLife[i] = 0; cntLifeSave(); }
+void fyUiLoadLife()     { lifePrefs.begin("fylife", true);
+                          lifePrefs.getBytes("life", cntLife, sizeof(cntLife));
+                          lifePrefs.end(); }
+
+static void drainAmbientBle() {
+  uint32_t now = millis();
+  while (true) {
+    portENTER_CRITICAL(&bleMux);
+    if (bleTail == bleHead) { portEXIT_CRITICAL(&bleMux); break; }
+    BleRaw r;
+    memcpy(&r, (const void*)&bleRing[bleTail], sizeof(r));
+    bleTail = (bleTail + 1) % BLE_RING_SIZE;
+    portEXIT_CRITICAL(&bleMux);
+
+    int slot = -1, oldest = 0;
+    for (int i = 0; i < bleCount; i++) {
+      if (memcmp(bleTab[i].mac, r.mac, 6) == 0) { slot = i; break; }
+      if (bleTab[i].lastSeen < bleTab[oldest].lastSeen) oldest = i;
+    }
+    bool bExisted = (slot >= 0);
+    bool bWasPrev = bExisted ? (bleTab[slot].prev != 0) : false;
+    if (slot < 0) {
+      slot = (bleCount < BLE_MAX) ? bleCount++ : oldest;
+      memcpy(bleTab[slot].mac, r.mac, 6);
+      bleTab[slot].firstSeen = now;
+      bleTab[slot].count = 0;
+      bleTab[slot].name[0] = '\0';
+      bleTab[slot].appearance = 0;
+      bleTab[slot].company = 0xFFFF;
+      bleTab[slot].svc = 0;
+      bleTab[slot].skimmer = 0;
+      ambDirty = true;
+    }
+    BleEntry& b = bleTab[slot];
+    uint8_t oldSkim = b.skimmer;
+    if (!bExisted || bWasPrev) cntBump(TDSC_BLE);
+    memcpy(b.mac, r.mac, 6);
+    b.addrType = r.addrType;
+    if (r.skimmer > b.skimmer) b.skimmer = r.skimmer;
+    if (b.skimmer >= 2 && oldSkim < 2) { cntBump(TDSC_SKIM); if (skimSeenAdd(b.mac)) seenSave(); }
+    b.rssi = (int8_t)((b.count ? b.rssi * 3 + r.rssi : r.rssi * 4) / 4);
+    if (r.appearance) b.appearance = r.appearance;
+    if (r.company != 0xFFFF) b.company = r.company;
+    if (r.svc) b.svc = r.svc;
+    b.prev = 0;
+    b.lastSeen = now;
+    if (b.count < 0xFFFF) b.count++;
+    if (r.name[0]) strlcpy(b.name, r.name, sizeof(b.name));
+    // A newly-identified skimmer suspect gets the same full-screen alert as a
+    // Flock hit (fires once, when the suspicion first rises for this device).
+    if (b.skimmer >= 2 && b.skimmer > oldSkim) {   // name match only; serial-service (1) stays quiet
+      char ms[18]; macToStr(b.mac, ms, sizeof(ms));
+      tdsSkimmerAlert(ms, b.name, b.skimmer, b.rssi);
+    }
+  }
+}
+
+int fyUiBleCount() { return bleCount; }
+bool fyUiGetBle(int i, TdsBleView* out) {
+  if (i < 0 || i >= bleCount || !out) return false;
+  const BleEntry& b = bleTab[i];
+  memcpy(out->mac, b.mac, 6);
+  out->addrType = b.addrType; out->rssi = b.rssi; out->prev = b.prev;
+  out->appearance = b.appearance; out->company = b.company; out->svc = b.svc;
+  out->skimmer = b.skimmer;
+  out->lastSeen = b.lastSeen; out->firstSeen = b.firstSeen; out->count = b.count;
+  strlcpy(out->name, b.name, sizeof(out->name));
+  return true;
+}
+
+// ---- persistence: both ambient tables to SPIFFS (display-only data) --------
+#define AMBIENT_FILE  "/ambient.bin"
+#define AMBIENT_MAGIC 0x414D4233u   // "AMB3" (bumped: BLE entries now carry skimmer flag)
+static uint32_t ambLastSaveAt = 0;
+
+#define SEEN_FILE  "/seen.bin"
+#define SEEN_MAGIC 0x5345454Eu   // "SEEN"
+static void seenSave() {
+  if (!fySpiffsReady) return;
+  File f = SPIFFS.open(SEEN_FILE ".tmp", FILE_WRITE);
+  if (!f) return;
+  uint32_t magic = SEEN_MAGIC;
+  f.write((uint8_t*)&magic, 4);
+  f.write((uint8_t*)&flockSeenN, 4);
+  f.write((uint8_t*)&skimSeenN, 4);
+  f.write((uint8_t*)flockSeen, (size_t)flockSeenN * 6);
+  f.write((uint8_t*)skimSeen, (size_t)skimSeenN * 6);
+  f.close();
+  SPIFFS.remove(SEEN_FILE);
+  SPIFFS.rename(SEEN_FILE ".tmp", SEEN_FILE);
+}
+static void seenLoad() {
+  if (!fySpiffsReady || !SPIFFS.exists(SEEN_FILE)) return;
+  File f = SPIFFS.open(SEEN_FILE, FILE_READ);
+  if (!f) return;
+  uint32_t magic = 0; int fn = 0, sn = 0;
+  if (f.read((uint8_t*)&magic, 4) != 4 || magic != SEEN_MAGIC) { f.close(); return; }
+  f.read((uint8_t*)&fn, 4);
+  f.read((uint8_t*)&sn, 4);
+  if (fn < 0 || fn > FLOCK_SEEN_MAX || sn < 0 || sn > SKIM_SEEN_MAX) { f.close(); return; }
+  f.read((uint8_t*)flockSeen, (size_t)fn * 6);
+  f.read((uint8_t*)skimSeen, (size_t)sn * 6);
+  flockSeenN = fn; skimSeenN = sn;
+  f.close();
+}
+// Recover unique flock MACs already written to a stored session file, so
+// cameras logged before the unique-set existed still count once.
+static void seenSeedFromSession(const char* path) {
+  if (!fySpiffsReady || !SPIFFS.exists(path)) return;
+  File f = SPIFFS.open(path, FILE_READ);
+  if (!f) return;
+  String data = f.readString();
+  f.close();
+  const char* key = "\"mac\":\"";
+  int idx = 0;
+  while ((idx = data.indexOf(key, idx)) >= 0) {
+    idx += 7;  // strlen(key)
+    unsigned bb[6];
+    if (sscanf(data.c_str() + idx, "%x:%x:%x:%x:%x:%x",
+               &bb[0],&bb[1],&bb[2],&bb[3],&bb[4],&bb[5]) == 6) {
+      uint8_t mb[6]; for (int i = 0; i < 6; i++) mb[i] = (uint8_t)bb[i];
+      flockSeenAdd(mb);
+    }
+  }
+}
+
+static void ambientSave() {
+  if (!fySpiffsReady) return;
+  File f = SPIFFS.open(AMBIENT_FILE ".tmp", FILE_WRITE);
+  if (!f) return;
+  uint32_t magic = AMBIENT_MAGIC;
+  f.write((uint8_t*)&magic, 4);
+  int wn = ambCount, bn = bleCount, sn = ssidRegCount;
+  f.write((uint8_t*)&wn, 4);
+  f.write((uint8_t*)&bn, 4);
+  f.write((uint8_t*)&sn, 4);
+  for (int i = 0; i < ambCount; i++)    f.write((uint8_t*)&ambTab[i],  sizeof(AmbEntry));
+  for (int i = 0; i < bleCount; i++)    f.write((uint8_t*)&bleTab[i],  sizeof(BleEntry));
+  for (int i = 0; i < ssidRegCount; i++) f.write((uint8_t*)&ssidReg[i], sizeof(SsidEntry));
+  f.close();
+  SPIFFS.remove(AMBIENT_FILE);
+  SPIFFS.rename(AMBIENT_FILE ".tmp", AMBIENT_FILE);
+  ambDirty = false;
+  ambLastSaveAt = millis();
+}
+
+static void ambientLoad() {
+  if (!fySpiffsReady || !SPIFFS.exists(AMBIENT_FILE)) return;
+  File f = SPIFFS.open(AMBIENT_FILE, FILE_READ);
+  if (!f) return;
+  uint32_t magic = 0; int wn = 0, bn = 0, sn = 0;
+  if (f.read((uint8_t*)&magic, 4) != 4 || magic != AMBIENT_MAGIC) { f.close(); return; }
+  f.read((uint8_t*)&wn, 4);
+  f.read((uint8_t*)&bn, 4);
+  f.read((uint8_t*)&sn, 4);
+  if (wn < 0 || wn > AMB_MAX || bn < 0 || bn > BLE_MAX || sn < 0 || sn > SSID_REG_MAX) {
+    f.close(); return;
+  }
+  for (int i = 0; i < wn; i++) {
+    if (f.read((uint8_t*)&ambTab[i], sizeof(AmbEntry)) != (int)sizeof(AmbEntry)) break;
+    ambTab[i].prev = 1; ambTab[i].lastSeen = 0; ambTab[i].firstSeen = 0;
+    ambCount = i + 1;
+  }
+  for (int i = 0; i < bn; i++) {
+    if (f.read((uint8_t*)&bleTab[i], sizeof(BleEntry)) != (int)sizeof(BleEntry)) break;
+    bleTab[i].prev = 1; bleTab[i].lastSeen = 0; bleTab[i].firstSeen = 0;
+    bleCount = i + 1;
+  }
+  for (int i = 0; i < sn; i++) {
+    if (f.read((uint8_t*)&ssidReg[i], sizeof(SsidEntry)) != (int)sizeof(SsidEntry)) break;
+    ssidReg[i].prev = 1; ssidReg[i].lastSeen = 0;
+    ssidRegCount = i + 1;
+  }
+  f.close();
+  dualPrintf("[flockyou] restored ambient: %d wifi, %d ble, %d ssids\n",
+             ambCount, bleCount, ssidRegCount);
+}
+
+// "Reset all the things": wipe every counter, live table and saved file, and
+// restore the beep mask default. Settings (brightness etc.) are cleared on the
+// display side. Confirmed by the user before this is ever called.
+void fyUiFactoryReset() {
+  for (int i = 0; i < TDSC_N; i++) { cntSess[i] = 0; cntLife[i] = 0; }
+  cntLifeDirty = false;
+  cntLifeSave();
+  ambCount = 0; bleCount = 0; ssidRegCount = 0; ambDirty = false;
+  fyDetCount = 0; fyDirty = false; fyLastSaveCount = 0;
+  if (fySpiffsReady) {
+    SPIFFS.remove(AMBIENT_FILE);
+    SPIFFS.remove(AMBIENT_FILE ".tmp");
+    SPIFFS.remove(FY_SESSION_FILE);
+    SPIFFS.remove(FY_SESSION_TMP);
+    SPIFFS.remove(FY_PREV_FILE);
+  }
+  flockSeenN = 0; skimSeenN = 0;
+  if (fySpiffsReady) { SPIFFS.remove(SEEN_FILE); SPIFFS.remove(SEEN_FILE ".tmp"); }
+  fyBeepMask = BEEP_MASK_DEFAULT;
+  fySaveBeepMask();
+  dualPrintln("[flockyou] FACTORY RESET - all counters, tables and saved files cleared");
+}
+
+static void ambientAutosaveTick() {
+  if (!ambDirty && !cntLifeDirty) return;         // nothing new to persist
+  if (millis() - ambLastSaveAt < 120000UL) return;  // and at most every 2 min
+  if (ambDirty) ambientSave();                    // clears ambDirty, sets ambLastSaveAt
+  if (cntLifeDirty) cntLifeSave();
+  ambLastSaveAt = millis();
+}
+#endif
+
 // ============================================================
 // SETUP / LOOP
 // ============================================================
@@ -1901,6 +2592,9 @@ void setup() {
 
 #ifdef BOARD_LILYGO_T_DONGLE_S3
   dongleDisplayInit();
+#endif
+#ifdef BOARD_LILYGO_T_DISPLAY_S3
+  tdsInit();
 #endif
 
 #if MIRROR_SERIAL
@@ -1936,9 +2630,21 @@ void setup() {
   if (SPIFFS.begin(true)) {
     fySpiffsReady = true;
     dualPrintln("[flockyou] SPIFFS ready");
+    tdsBootLine("SPIFFS ready, previous session saved");
     fyPromotePrevSession();
+#ifdef BOARD_LILYGO_T_DISPLAY_S3
+    ambientLoad();
+    fyUiLoadLife();
+    seenLoad();
+    int seed0 = flockSeenN;
+    seenSeedFromSession(FY_PREV_FILE);
+    seenSeedFromSession(FY_SESSION_FILE);
+    if (flockSeenN != seed0) seenSave();    // recovered some from stored sessions
+    dualPrintf("[flockyou] unique seen: %d flock, %d skimmer\n", flockSeenN, skimSeenN);
+#endif
   } else {
     dualPrintln("[flockyou] SPIFFS init FAILED — running without persistence");
+    tdsBootLine("SPIFFS FAILED - no persistence");
   }
 
   WiFi.mode(WIFI_MODE_NULL);
@@ -1966,6 +2672,7 @@ void setup() {
   // BLE side of the union — passive NimBLE scan sharing the radio with
   // promiscuous WiFi RX (low duty cycle; see the BLE section above).
   fyBleStart();
+  tdsBootLine("WiFi sniffer + BLE scan running");
 
   dualPrintln("[flockyou] merged WiFi detector started");
   dualPrintf("[flockyou] mode=%s dwell_ms=%u start_channel=%u rssi_min=%d spiffs=%d\n",
@@ -1992,6 +2699,12 @@ void loop() {
   heartbeatTick();     // audible beep-pair while a target is still in range
   ledTick();           // turn off LED after LED_FLASH_MS
   dongleDisplayTick(millis(), currentChannel, fyDetCount);
+#ifdef BOARD_LILYGO_T_DISPLAY_S3
+  drainAmbient();
+  drainAmbientBle();
+  ambientAutosaveTick();
+  tdsTick(millis(), currentChannel);
+#endif
   printHeartbeat();
   delay(1);
 }
